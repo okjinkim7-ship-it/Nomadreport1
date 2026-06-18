@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import os
+import uuid
 from datetime import datetime
 import streamlit as st
 from openai import OpenAI
@@ -15,15 +16,48 @@ from agents import Agent, Runner, SQLiteSession, WebSearchTool, FileSearchTool, 
 JOURNAL_FILE = "journal.txt"
 VS_ID_FILE = "vector_store_id.txt"
 GOALS_FILE = "goals.txt"
+SESSIONS_FILE = "sessions.json"
+DB_PATH = "chat-gpt-clone-memory.db"
 
-# ─── OpenAI 클라이언트 (벡터 스토어 관리용) ──────────────────────────────────
 openai_client = OpenAI()
 
 
-# ─── 벡터 스토어 관리 함수 ───────────────────────────────────────────────────
+# ─── 세션 메타데이터 관리 ─────────────────────────────────────────────────────
+
+def load_session_list() -> list[dict]:
+    if os.path.exists(SESSIONS_FILE):
+        with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return []
+
+
+def save_session_list(sessions: list[dict]):
+    with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump(sessions, f, ensure_ascii=False, indent=2)
+
+
+def upsert_session_meta(session_id: str, title: str):
+    sessions = load_session_list()
+    existing = next((s for s in sessions if s["id"] == session_id), None)
+    if existing:
+        existing["title"] = title
+    else:
+        sessions.insert(0, {
+            "id": session_id,
+            "title": title,
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        })
+    save_session_list(sessions)
+
+
+def remove_session_meta(session_id: str):
+    sessions = [s for s in load_session_list() if s["id"] != session_id]
+    save_session_list(sessions)
+
+
+# ─── 벡터 스토어 관리 ────────────────────────────────────────────────────────
 
 def load_or_create_vector_store() -> str:
-    """벡터 스토어 ID 로드 또는 신규 생성"""
     if os.path.exists(VS_ID_FILE):
         with open(VS_ID_FILE, "r", encoding="utf-8") as f:
             vs_id = f.read().strip()
@@ -63,30 +97,30 @@ def append_journal_entry(text: str):
         f.write(f"\n## 일기 [{timestamp}]\n{text}\n")
 
 
-# ─── 앱 초기화 ───────────────────────────────────────────────────────────────
+# ─── 페이지 설정 ──────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="Life Coach", page_icon="🌱", layout="centered")
-st.title("🌱 Life Coach Agent")
-st.caption("목표를 기억하고, 조언하고, 비전 보드를 만드는 AI 라이프 코치")
+st.set_page_config(page_title="Life Coach", page_icon="🌱", layout="wide")
 
-# 벡터 스토어 ID
+# ─── 벡터 스토어 초기화 ───────────────────────────────────────────────────────
+
 if "vs_id" not in st.session_state:
     with st.spinner("목표 문서 저장소 초기화 중..."):
         vs_id = load_or_create_vector_store()
         st.session_state["vs_id"] = vs_id
-
         if os.path.exists(GOALS_FILE) and "goals_uploaded" not in st.session_state:
             try:
                 upload_local_file_to_vector_store(vs_id, GOALS_FILE)
                 st.session_state["goals_uploaded"] = True
-            except Exception as e:
-                st.warning(f"기본 목표 파일 업로드 실패: {e}")
+            except Exception:
+                pass
 
 vs_id = st.session_state["vs_id"]
 
-# Agent 초기화
-if "agent" not in st.session_state:
-    st.session_state["agent"] = Agent(
+
+# ─── 현재 세션 관리 ───────────────────────────────────────────────────────────
+
+def make_agent(vs_id: str) -> Agent:
+    return Agent(
         name="Life Coach",
         instructions="""
         당신은 따뜻하고 열정적인 라이프 코치입니다.
@@ -116,36 +150,45 @@ if "agent" not in st.session_state:
         - 답변 마지막에 격려의 말 한 마디를 꼭 추가하세요
         """,
         tools=[
-            FileSearchTool(
-                vector_store_ids=[vs_id],
-                max_num_results=5,
-            ),
+            FileSearchTool(vector_store_ids=[vs_id], max_num_results=5),
             WebSearchTool(),
             ImageGenerationTool(
-                tool_config={
-                    "type": "image_generation",
-                    "quality": "low",
-                    "size": "1024x1024",
-                }
+                tool_config={"type": "image_generation", "quality": "low", "size": "1024x1024"}
             ),
         ],
     )
 
-agent = st.session_state["agent"]
 
-# SQLite 세션 (대화 메모리)
-if "session" not in st.session_state:
-    st.session_state["session"] = SQLiteSession(
-        "life-coach-session",
-        "chat-gpt-clone-memory.db",
-    )
-
-session = st.session_state["session"]
-
-# 화면 표시용 메시지 히스토리
-# 각 메시지: {"role": str, "content": str, "images": list[bytes]}
-if "messages" not in st.session_state:
+def new_chat():
+    """새 대화 세션 생성"""
+    session_id = str(uuid.uuid4())
+    st.session_state["current_session_id"] = session_id
+    st.session_state["agent"] = make_agent(vs_id)
+    st.session_state["session"] = SQLiteSession(session_id, DB_PATH)
     st.session_state["messages"] = []
+    # 세션별 시각 메시지 저장소 초기화
+    if "session_messages" not in st.session_state:
+        st.session_state["session_messages"] = {}
+    st.session_state["session_messages"][session_id] = []
+
+
+def switch_chat(session_id: str):
+    """기존 대화 세션으로 전환"""
+    st.session_state["current_session_id"] = session_id
+    st.session_state["agent"] = make_agent(vs_id)
+    st.session_state["session"] = SQLiteSession(session_id, DB_PATH)
+    # 저장된 시각 메시지 복원 (이미지는 바이트로 저장됨)
+    saved = st.session_state.get("session_messages", {}).get(session_id, [])
+    st.session_state["messages"] = saved
+
+
+# 최초 실행 시 새 대화 생성
+if "current_session_id" not in st.session_state:
+    new_chat()
+
+agent = st.session_state["agent"]
+session = st.session_state["session"]
+current_sid = st.session_state["current_session_id"]
 
 
 # ─── 에이전트 실행 ────────────────────────────────────────────────────────────
@@ -163,25 +206,20 @@ async def run_agent(message: str):
         image_area = st.container()
 
         async for event in stream.stream_events():
-
-            # ── 도구 호출 / 결과 이벤트 ─────────────────────────────────
             if event.type == "run_item_stream_event":
                 item = getattr(event, "item", None)
                 item_type = getattr(item, "type", None) if item else None
 
-                # 파일 검색 (ToolSearchCallItem)
                 if item_type == "tool_search_call_item":
                     if "📂 목표 문서 검색 중..." not in active_tools:
                         active_tools.append("📂 목표 문서 검색 중...")
                     status_area.info("\n\n".join(active_tools))
 
-                # 일반 도구 호출 (ToolCallItem)
                 elif item_type == "tool_call_item":
                     raw = getattr(item, "raw_item", None)
                     if raw:
                         raw_item_type = getattr(raw, "type", "")
 
-                        # 이미지 생성
                         if raw_item_type == "image_generation_call":
                             status = getattr(raw, "status", "")
                             if status in ("in_progress", "generating"):
@@ -195,7 +233,6 @@ async def run_agent(message: str):
                                     generated_images.append(img_bytes)
                                     image_area.image(img_bytes, use_container_width=True)
 
-                        # 웹 검색 (ResponseFunctionWebSearch)
                         elif "web_search" in str(raw_item_type):
                             action = getattr(raw, "action", None)
                             if action:
@@ -204,7 +241,6 @@ async def run_agent(message: str):
                                     active_tools.append(f"🔍 웹 검색: **{query}**")
                                     status_area.info("\n\n".join(active_tools))
 
-            # ── 텍스트 스트리밍 ─────────────────────────────────────────
             elif event.type == "raw_response_event":
                 if hasattr(event.data, "type") and event.data.type == "response.output_text.delta":
                     response_text += event.data.delta
@@ -218,77 +254,99 @@ async def run_agent(message: str):
 # ─── 사이드바 ─────────────────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.header("⚙️ 설정")
+    st.title("🌱 Life Coach")
+
+    # ── 새 대화 버튼 ──────────────────────────────────────────────────
+    if st.button("✏️ 새 대화", use_container_width=True, type="primary"):
+        new_chat()
+        st.rerun()
+
+    st.divider()
+
+    # ── 대화 히스토리 목록 ────────────────────────────────────────────
+    st.subheader("💬 대화 목록")
+    session_list = load_session_list()
+
+    if not session_list:
+        st.caption("대화 기록이 없습니다.")
+    else:
+        for s in session_list:
+            sid = s["id"]
+            title = s.get("title", "새 대화")
+            created = s.get("created_at", "")
+            is_active = sid == current_sid
+
+            col1, col2 = st.columns([5, 1])
+            with col1:
+                label = f"**{title}**" if is_active else title
+                if st.button(
+                    label,
+                    key=f"sess_{sid}",
+                    use_container_width=True,
+                    help=created,
+                ):
+                    if not is_active:
+                        switch_chat(sid)
+                        st.rerun()
+            with col2:
+                if st.button("🗑", key=f"del_{sid}", help="삭제"):
+                    # SQLite 세션 데이터 삭제
+                    tmp = SQLiteSession(sid, DB_PATH)
+                    asyncio.run(tmp.clear_session())
+                    remove_session_meta(sid)
+                    # 시각 메시지도 삭제
+                    st.session_state.get("session_messages", {}).pop(sid, None)
+                    if sid == current_sid:
+                        new_chat()
+                    st.rerun()
+
+    st.divider()
 
     # ── 목표 문서 업로드 ──────────────────────────────────────────────
-    st.subheader("📎 목표 문서 업로드")
-    st.caption("PDF 또는 TXT 파일을 업로드하면 코치가 참고합니다.")
+    st.subheader("📎 목표 문서")
     uploaded_file = st.file_uploader(
-        "파일 선택",
+        "PDF/TXT 업로드",
         type=["txt", "pdf"],
         label_visibility="collapsed",
     )
     if uploaded_file is not None:
         if st.button("📤 업로드", use_container_width=True):
-            with st.spinner("파일을 목표 저장소에 업로드 중..."):
+            with st.spinner("업로드 중..."):
                 try:
-                    upload_bytes_to_vector_store(
-                        vs_id,
-                        uploaded_file.getvalue(),
-                        uploaded_file.name,
-                    )
-                    st.success(f"✅ '{uploaded_file.name}' 업로드 완료!")
+                    upload_bytes_to_vector_store(vs_id, uploaded_file.getvalue(), uploaded_file.name)
+                    st.success(f"✅ '{uploaded_file.name}' 완료!")
                 except Exception as e:
-                    st.error(f"업로드 실패: {e}")
+                    st.error(f"실패: {e}")
 
     st.divider()
 
-    # ── 일기 / 진행 상황 기록 ─────────────────────────────────────────
+    # ── 일기 기록 ────────────────────────────────────────────────────
     st.subheader("📝 오늘의 일기")
-    st.caption("목표 달성 현황이나 오늘의 기록을 남겨보세요.")
     journal_text = st.text_area(
-        "일기 내용",
-        placeholder="예) 오늘 운동 30분 완료! 물 2리터 마심. 독서 1챕터 읽었다.",
-        height=120,
+        "일기",
+        placeholder="오늘 운동 30분 완료! 물 2리터 마심.",
+        height=100,
         label_visibility="collapsed",
     )
-    if st.button("💾 일기 저장 & 업로드", use_container_width=True):
+    if st.button("💾 저장 & 업로드", use_container_width=True):
         if journal_text.strip():
-            with st.spinner("일기를 저장 중..."):
+            with st.spinner("저장 중..."):
                 try:
                     append_journal_entry(journal_text.strip())
                     upload_local_file_to_vector_store(vs_id, JOURNAL_FILE)
-                    st.success("✅ 일기가 저장되었습니다!")
+                    st.success("✅ 저장됐습니다!")
                 except Exception as e:
-                    st.error(f"일기 저장 실패: {e}")
+                    st.error(f"실패: {e}")
         else:
-            st.warning("일기 내용을 입력해주세요.")
-
-    st.divider()
-
-    # ── 대화 관리 ─────────────────────────────────────────────────────
-    st.subheader("💬 대화 관리")
-    if st.button("🗑️ 대화 기록 초기화", use_container_width=True):
-        asyncio.run(session.clear_session())
-        st.session_state["messages"] = []
-        st.rerun()
-
-    history = asyncio.run(session.get_items())
-    st.caption(f"저장된 메시지: {len(history)}개")
-
-    st.divider()
-
-    # ── 예시 질문 ─────────────────────────────────────────────────────
-    st.subheader("💡 예시 질문")
-    st.markdown("- 내 운동 목표 달성은 잘 되어가고 있어?")
-    st.markdown("- 올해 목표로 비전 보드를 만들어줘")
-    st.markdown("- 동기부여 포스터 하나 만들어줘")
-    st.markdown("- 독서 목표 달성했어! 축하 이미지 만들어줘")
-    st.markdown("- 이번 달 재정 목표 전략 알려줘")
+            st.warning("내용을 입력하세요.")
 
 
-# ─── 채팅 화면 ────────────────────────────────────────────────────────────────
+# ─── 메인 채팅 화면 ───────────────────────────────────────────────────────────
 
+st.title("🌱 Life Coach Agent")
+st.caption("목표를 기억하고, 조언하고, 비전 보드를 만드는 AI 라이프 코치")
+
+# 기존 메시지 표시
 for msg in st.session_state["messages"]:
     with st.chat_message(msg["role"]):
         if msg.get("content"):
@@ -296,18 +354,30 @@ for msg in st.session_state["messages"]:
         for img_bytes in msg.get("images", []):
             st.image(img_bytes, use_container_width=True)
 
+# 채팅 입력
 prompt = st.chat_input("코치에게 고민을 이야기해보세요...")
 
 if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
-    st.session_state["messages"].append({"role": "user", "content": prompt, "images": []})
+    user_msg = {"role": "user", "content": prompt, "images": []}
+    st.session_state["messages"].append(user_msg)
 
+    # 세션 메타데이터 저장 (첫 메시지로 제목 설정)
+    session_list = load_session_list()
+    existing = next((s for s in session_list if s["id"] == current_sid), None)
+    title = (prompt[:28] + "...") if len(prompt) > 28 else prompt
+    if not existing:
+        upsert_session_meta(current_sid, title)
+
+    # 에이전트 실행
     response_text, generated_images = asyncio.run(run_agent(prompt))
 
     if response_text or generated_images:
-        st.session_state["messages"].append({
-            "role": "assistant",
-            "content": response_text,
-            "images": generated_images,
-        })
+        asst_msg = {"role": "assistant", "content": response_text, "images": generated_images}
+        st.session_state["messages"].append(asst_msg)
+
+        # 세션별 시각 메시지 저장
+        if "session_messages" not in st.session_state:
+            st.session_state["session_messages"] = {}
+        st.session_state["session_messages"][current_sid] = st.session_state["messages"]
