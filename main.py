@@ -199,6 +199,7 @@ async def run_agent(message: str):
     response_text = ""
     active_tools: list[str] = []
     generated_images: list[bytes] = []
+    shown_image_ids: set[str] = set()  # 중복 표시 방지
 
     with st.chat_message("assistant"):
         status_area = st.empty()
@@ -221,17 +222,20 @@ async def run_agent(message: str):
                         raw_item_type = getattr(raw, "type", "")
 
                         if raw_item_type == "image_generation_call":
-                            status = getattr(raw, "status", "")
-                            if status in ("in_progress", "generating"):
+                            result_b64 = getattr(raw, "result", None)
+                            img_id = getattr(raw, "id", "")
+
+                            # result가 있으면 즉시 표시 (status가 "generating"이어도 결과가 담겨 옴)
+                            if result_b64 and img_id not in shown_image_ids:
+                                shown_image_ids.add(img_id)
+                                img_bytes = base64.b64decode(result_b64)
+                                generated_images.append(img_bytes)
+                                image_area.image(img_bytes, use_container_width=True)
+                            elif not result_b64:
+                                # 아직 생성 중 — 상태 표시
                                 if "🎨 이미지 생성 중..." not in active_tools:
                                     active_tools.append("🎨 이미지 생성 중...")
                                     status_area.info("\n\n".join(active_tools))
-                            elif status == "completed":
-                                result_b64 = getattr(raw, "result", None)
-                                if result_b64:
-                                    img_bytes = base64.b64decode(result_b64)
-                                    generated_images.append(img_bytes)
-                                    image_area.image(img_bytes, use_container_width=True)
 
                         elif "web_search" in str(raw_item_type):
                             action = getattr(raw, "action", None)
