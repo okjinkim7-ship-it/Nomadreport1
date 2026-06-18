@@ -12,6 +12,22 @@ import streamlit as st
 from openai import OpenAI
 from agents import Agent, Runner, SQLiteSession, WebSearchTool, FileSearchTool, ImageGenerationTool
 
+# ─── 커스텀 세션: image_generation_call의 API 미지원 필드 제거 ────────────────
+# image_generation_call 항목을 히스토리로 재전송할 때 'action', 'background' 등
+# Responses API input에서 허용되지 않는 필드가 포함되어 400 에러 발생.
+# get_items() 후 해당 필드를 제거하여 해결.
+_IMAGE_GEN_STRIP = {"action", "background", "output_format", "quality", "revised_prompt", "size"}
+
+class CleanSQLiteSession(SQLiteSession):
+    async def get_items(self, limit=None):
+        items = await super().get_items(limit)
+        cleaned = []
+        for item in items:
+            if isinstance(item, dict) and item.get("type") == "image_generation_call":
+                item = {k: v for k, v in item.items() if k not in _IMAGE_GEN_STRIP}
+            cleaned.append(item)
+        return cleaned
+
 # ─── 상수 ───────────────────────────────────────────────────────────────────
 JOURNAL_FILE = "journal.txt"
 VS_ID_FILE = "vector_store_id.txt"
@@ -164,7 +180,7 @@ def new_chat():
     session_id = str(uuid.uuid4())
     st.session_state["current_session_id"] = session_id
     st.session_state["agent"] = make_agent(vs_id)
-    st.session_state["session"] = SQLiteSession(session_id, DB_PATH)
+    st.session_state["session"] = CleanSQLiteSession(session_id, DB_PATH)
     st.session_state["messages"] = []
     # 세션별 시각 메시지 저장소 초기화
     if "session_messages" not in st.session_state:
@@ -176,7 +192,7 @@ def switch_chat(session_id: str):
     """기존 대화 세션으로 전환"""
     st.session_state["current_session_id"] = session_id
     st.session_state["agent"] = make_agent(vs_id)
-    st.session_state["session"] = SQLiteSession(session_id, DB_PATH)
+    st.session_state["session"] = CleanSQLiteSession(session_id, DB_PATH)
     # 저장된 시각 메시지 복원 (이미지는 바이트로 저장됨)
     saved = st.session_state.get("session_messages", {}).get(session_id, [])
     st.session_state["messages"] = saved
@@ -295,7 +311,7 @@ with st.sidebar:
             with col2:
                 if st.button("🗑", key=f"del_{sid}", help="삭제"):
                     # SQLite 세션 데이터 삭제
-                    tmp = SQLiteSession(sid, DB_PATH)
+                    tmp = CleanSQLiteSession(sid, DB_PATH)
                     asyncio.run(tmp.clear_session())
                     remove_session_meta(sid)
                     # 시각 메시지도 삭제
