@@ -3,12 +3,13 @@ import dotenv
 dotenv.load_dotenv()
 
 import asyncio
+import base64
 import json
 import os
 from datetime import datetime
 import streamlit as st
 from openai import OpenAI
-from agents import Agent, Runner, SQLiteSession, WebSearchTool, FileSearchTool
+from agents import Agent, Runner, SQLiteSession, WebSearchTool, FileSearchTool, ImageGenerationTool
 
 # ─── 상수 ───────────────────────────────────────────────────────────────────
 JOURNAL_FILE = "journal.txt"
@@ -30,7 +31,7 @@ def load_or_create_vector_store() -> str:
             openai_client.vector_stores.retrieve(vs_id)
             return vs_id
         except Exception:
-            pass  # 유효하지 않으면 새로 생성
+            pass
 
     vs = openai_client.vector_stores.create(name="Life Coach Memory")
     with open(VS_ID_FILE, "w", encoding="utf-8") as f:
@@ -39,13 +40,10 @@ def load_or_create_vector_store() -> str:
 
 
 def upload_bytes_to_vector_store(vs_id: str, content: bytes, filename: str) -> str:
-    """바이트 데이터를 OpenAI 파일로 업로드 후 벡터 스토어에 추가"""
-    # 파일 업로드
     file_obj = openai_client.files.create(
         file=(filename, content, "text/plain"),
         purpose="assistants",
     )
-    # 벡터 스토어에 연결 (완료 대기)
     openai_client.vector_stores.files.create(
         vector_store_id=vs_id,
         file_id=file_obj.id,
@@ -54,14 +52,12 @@ def upload_bytes_to_vector_store(vs_id: str, content: bytes, filename: str) -> s
 
 
 def upload_local_file_to_vector_store(vs_id: str, path: str) -> str:
-    """로컬 파일을 벡터 스토어에 업로드"""
     with open(path, "rb") as f:
         content = f.read()
     return upload_bytes_to_vector_store(vs_id, content, os.path.basename(path))
 
 
 def append_journal_entry(text: str):
-    """일기 항목을 journal.txt 에 추가 저장"""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
     with open(JOURNAL_FILE, "a", encoding="utf-8") as f:
         f.write(f"\n## 일기 [{timestamp}]\n{text}\n")
@@ -71,15 +67,14 @@ def append_journal_entry(text: str):
 
 st.set_page_config(page_title="Life Coach", page_icon="🌱", layout="centered")
 st.title("🌱 Life Coach Agent")
-st.caption("목표와 일기를 기억하는 AI 라이프 코치입니다")
+st.caption("목표를 기억하고, 조언하고, 비전 보드를 만드는 AI 라이프 코치")
 
-# 벡터 스토어 ID (세션)
+# 벡터 스토어 ID
 if "vs_id" not in st.session_state:
     with st.spinner("목표 문서 저장소 초기화 중..."):
         vs_id = load_or_create_vector_store()
         st.session_state["vs_id"] = vs_id
 
-        # 최초 실행 시 기본 goals.txt 자동 업로드
         if os.path.exists(GOALS_FILE) and "goals_uploaded" not in st.session_state:
             try:
                 upload_local_file_to_vector_store(vs_id, GOALS_FILE)
@@ -103,12 +98,16 @@ if "agent" not in st.session_state:
         - 사용자의 고민을 경청하고 구체적인 해결책을 제시합니다
 
         도구 활용 지침:
-        - **파일 검색(file_search)**: 사용자의 목표나 진행 상황에 관한 질문이 오면
-          반드시 먼저 파일 검색으로 업로드된 목표 문서와 일기를 확인하세요.
-          예) "내 목표가 뭐야?", "운동 목표는?", "이번 달 계획은?" 등
-        - **웹 검색(web_search)**: 파일 검색 후, 목표와 관련된 최신 팁·연구·방법을
-          웹에서 추가로 검색하여 개인화된 추천을 제공하세요.
-        - 두 도구를 함께 사용해 "개인 목표 + 최신 정보"를 결합한 조언을 하세요.
+        1. **파일 검색(file_search)**: 목표·일기·진행 상황 관련 질문이 오면
+           반드시 먼저 파일을 검색하여 개인 목표 문서와 일기를 확인하세요.
+        2. **웹 검색(web_search)**: 최신 팁·연구·방법을 검색해 개인 목표와 결합한
+           맞춤 조언을 제공하세요.
+        3. **이미지 생성(image_generation)**: 다음 상황에서 적극적으로 이미지를 생성하세요.
+           - 사용자가 목표를 달성했을 때 → 축하 이미지
+           - 비전 보드 요청 → 목표들을 담은 영감을 주는 비전 보드
+           - 동기부여 포스터 요청 → 맞춤 메시지가 담긴 포스터
+           - 진행 상황 시각화 요청 → 진행 상황을 보여주는 이미지
+           프롬프트는 **반드시 영어**로 작성하고, 밝고 긍정적이며 고해상도 스타일로 요청하세요.
 
         답변 형식:
         - 조언은 단계별로 나누어 실행하기 쉽게 설명하세요
@@ -122,6 +121,13 @@ if "agent" not in st.session_state:
                 max_num_results=5,
             ),
             WebSearchTool(),
+            ImageGenerationTool(
+                tool_config={
+                    "type": "image_generation",
+                    "quality": "low",
+                    "size": "1024x1024",
+                }
+            ),
         ],
     )
 
@@ -137,6 +143,7 @@ if "session" not in st.session_state:
 session = st.session_state["session"]
 
 # 화면 표시용 메시지 히스토리
+# 각 메시지: {"role": str, "content": str, "images": list[bytes]}
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 
@@ -148,38 +155,56 @@ async def run_agent(message: str):
 
     response_text = ""
     active_tools: list[str] = []
+    generated_images: list[bytes] = []
 
     with st.chat_message("assistant"):
         status_area = st.empty()
         text_placeholder = st.empty()
+        image_area = st.container()
 
         async for event in stream.stream_events():
-            # 도구 호출 감지 — RunItemStreamEvent는 event.item 을 직접 가짐
+
+            # ── 도구 호출 / 결과 이벤트 ─────────────────────────────────
             if event.type == "run_item_stream_event":
                 item = getattr(event, "item", None)
+                item_type = getattr(item, "type", None) if item else None
 
                 # 파일 검색 (ToolSearchCallItem)
-                if item and getattr(item, "type", None) == "tool_search_call_item":
-                    active_tools.append("📂 목표 문서 검색 중...")
+                if item_type == "tool_search_call_item":
+                    if "📂 목표 문서 검색 중..." not in active_tools:
+                        active_tools.append("📂 목표 문서 검색 중...")
                     status_area.info("\n\n".join(active_tools))
 
-                # 일반 도구 호출 (ToolCallItem) — 웹 검색 포함
-                elif item and getattr(item, "type", None) == "tool_call_item":
+                # 일반 도구 호출 (ToolCallItem)
+                elif item_type == "tool_call_item":
                     raw = getattr(item, "raw_item", None)
                     if raw:
-                        raw_type = str(type(raw))
-                        query = None
+                        raw_item_type = getattr(raw, "type", "")
 
-                        # 웹 검색: ResponseFunctionWebSearch
-                        if "web_search" in raw_type.lower() or "web_search" in str(getattr(raw, "type", "")):
+                        # 이미지 생성
+                        if raw_item_type == "image_generation_call":
+                            status = getattr(raw, "status", "")
+                            if status in ("in_progress", "generating"):
+                                if "🎨 이미지 생성 중..." not in active_tools:
+                                    active_tools.append("🎨 이미지 생성 중...")
+                                    status_area.info("\n\n".join(active_tools))
+                            elif status == "completed":
+                                result_b64 = getattr(raw, "result", None)
+                                if result_b64:
+                                    img_bytes = base64.b64decode(result_b64)
+                                    generated_images.append(img_bytes)
+                                    image_area.image(img_bytes, use_container_width=True)
+
+                        # 웹 검색 (ResponseFunctionWebSearch)
+                        elif "web_search" in str(raw_item_type):
                             action = getattr(raw, "action", None)
                             if action:
                                 query = getattr(action, "query", None)
-                            if query:
-                                active_tools.append(f"🔍 웹 검색: **{query}**")
-                                status_area.info("\n\n".join(active_tools))
+                                if query:
+                                    active_tools.append(f"🔍 웹 검색: **{query}**")
+                                    status_area.info("\n\n".join(active_tools))
 
-            # 텍스트 스트리밍
+            # ── 텍스트 스트리밍 ─────────────────────────────────────────
             elif event.type == "raw_response_event":
                 if hasattr(event.data, "type") and event.data.type == "response.output_text.delta":
                     response_text += event.data.delta
@@ -187,7 +212,7 @@ async def run_agent(message: str):
 
         status_area.empty()
 
-    return response_text
+    return response_text, generated_images
 
 
 # ─── 사이드바 ─────────────────────────────────────────────────────────────────
@@ -256,26 +281,33 @@ with st.sidebar:
     # ── 예시 질문 ─────────────────────────────────────────────────────
     st.subheader("💡 예시 질문")
     st.markdown("- 내 운동 목표 달성은 잘 되어가고 있어?")
-    st.markdown("- 이번 달 중점 과제가 뭐였지?")
-    st.markdown("- 독서 목표에 대한 팁을 알려줘")
-    st.markdown("- 아침 루틴 만드는 방법")
-    st.markdown("- 재정 목표 달성 전략이 궁금해")
+    st.markdown("- 올해 목표로 비전 보드를 만들어줘")
+    st.markdown("- 동기부여 포스터 하나 만들어줘")
+    st.markdown("- 독서 목표 달성했어! 축하 이미지 만들어줘")
+    st.markdown("- 이번 달 재정 목표 전략 알려줘")
 
 
 # ─── 채팅 화면 ────────────────────────────────────────────────────────────────
 
 for msg in st.session_state["messages"]:
     with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+        if msg.get("content"):
+            st.markdown(msg["content"])
+        for img_bytes in msg.get("images", []):
+            st.image(img_bytes, use_container_width=True)
 
 prompt = st.chat_input("코치에게 고민을 이야기해보세요...")
 
 if prompt:
     with st.chat_message("user"):
         st.markdown(prompt)
-    st.session_state["messages"].append({"role": "user", "content": prompt})
+    st.session_state["messages"].append({"role": "user", "content": prompt, "images": []})
 
-    response_text = asyncio.run(run_agent(prompt))
+    response_text, generated_images = asyncio.run(run_agent(prompt))
 
-    if response_text:
-        st.session_state["messages"].append({"role": "assistant", "content": response_text})
+    if response_text or generated_images:
+        st.session_state["messages"].append({
+            "role": "assistant",
+            "content": response_text,
+            "images": generated_images,
+        })
