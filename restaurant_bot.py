@@ -1,3 +1,4 @@
+import os
 import dotenv
 
 dotenv.load_dotenv()
@@ -5,6 +6,11 @@ dotenv.load_dotenv()
 import asyncio
 from pydantic import BaseModel
 import streamlit as st
+
+# Streamlit Cloud secrets → 환경변수로 설정
+if "OPENAI_API_KEY" in st.secrets:
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+
 from agents import (
     Agent,
     Runner,
